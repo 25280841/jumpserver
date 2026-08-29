@@ -2,7 +2,7 @@
 `m2m_changed`
 
 ```
-def m2m_signals_handler(action, instance, reverse, model, pk_set, using):
+def m2m_signal_handler(action, instance, reverse, model, pk_set, using):
      pass
 ```
 """
@@ -12,3 +12,8 @@ PRE_REMOVE = 'pre_remove'
 POST_REMOVE = 'post_remove'
 PRE_CLEAR = 'pre_clear'
 POST_CLEAR = 'post_clear'
+
+POST_PREFIX = 'post'
+PRE_PREFIX = 'pre'
+
+OP_LOG_SKIP_SIGNAL = 'operate_log_skip_signal'

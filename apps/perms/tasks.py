@@ -1,122 +1,112 @@
 # ~*~ coding: utf-8 ~*~
 from __future__ import absolute_import, unicode_literals
+
+from collections import defaultdict
 from datetime import timedelta
 
-from django.db import transaction
-from django.db.models import Q
-from django.db.transaction import atomic
 from celery import shared_task
+from django.conf import settings
+from django.db.transaction import atomic
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from common.const.crontab import CRONTAB_AT_AM_TEN
 from common.utils import get_logger
-from common.utils.timezone import now, dt_formater, dt_parser
-from users.models import User
-from assets.models import Node
-from perms.models import RebuildUserTreeTask, AssetPermission
-from perms.utils.user_asset_permission import rebuild_user_mapping_nodes_if_need_with_lock, lock
+from common.utils.timezone import dt_parser, local_now
+from ops.celery.decorator import register_as_period_task
+from orgs.utils import tmp_to_root_org
+from perms.models import AssetPermission
+from perms.notifications import (
+    PermedAssetsWillExpireUserMsg,
+    AssetPermsWillExpireForOrgAdminMsg,
+)
+from perms.utils import UserPermTreeExpireUtil
 
 logger = get_logger(__file__)
 
 
-@shared_task(queue='node_tree')
-def rebuild_user_mapping_nodes_celery_task(user_id):
-    user = User.objects.get(id=user_id)
-    try:
-        rebuild_user_mapping_nodes_if_need_with_lock(user)
-    except lock.SomeoneIsDoingThis:
-        pass
-
-
-@shared_task(queue='node_tree')
-def dispatch_mapping_node_tasks():
-    user_ids = RebuildUserTreeTask.objects.all().values_list('user_id', flat=True).distinct()
-    logger.info(f'>>> dispatch_mapping_node_tasks for users {list(user_ids)}')
-    for id in user_ids:
-        rebuild_user_mapping_nodes_celery_task.delay(id)
-
-
-@shared_task(queue='check_asset_perm_expired')
+@shared_task(
+    verbose_name=_('Check asset permission expired'),
+    description=_(
+        """The cache of organizational collections, which have completed user authorization tree 
+        construction, will expire. Therefore, expired collections need to be cleared from the 
+        cache, and this task will be executed periodically based on the time interval specified 
+        by PERM_EXPIRED_CHECK_PERIODIC in the system configuration file config.txt"""
+    )
+)
+@register_as_period_task(interval=settings.PERM_EXPIRED_CHECK_PERIODIC)
 @atomic()
+@tmp_to_root_org()
 def check_asset_permission_expired():
-    """
-    这里的任务要足够短，不要影响周期任务
-    """
-    from settings.models import Setting
+    """ 这里的任务要足够短，不要影响周期任务 """
+    perms = AssetPermission.objects.get_expired_permissions()
+    perm_ids = list(perms.distinct().values_list('id', flat=True))
+    show_perm_ids = perm_ids[:5]
+    logger.info(f'Checking expired permissions: {show_perm_ids} ...')
+    UserPermTreeExpireUtil().expire_perm_tree_for_perms(perm_ids)
 
-    setting_name = 'last_asset_perm_expired_check'
 
-    end = now()
-    default_start = end - timedelta(days=36000)  # Long long ago in china
-
-    defaults = {'value': dt_formater(default_start)}
-    setting, created = Setting.objects.get_or_create(
-        name=setting_name, defaults=defaults
+@shared_task(
+    verbose_name=_('Send asset permission expired notification'),
+    description=_(
+        """Check every day at 10 a.m. and send a notification message to users associated with 
+        assets whose authorization is about to expire, as well as to the organization's 
+        administrators in advance, to remind them that the asset authorization
+        will expire in a few days"""
     )
-    if created:
-        start = default_start
-    else:
-        start = dt_parser(setting.value)
-    setting.value = dt_formater(end)
-    setting.save()
+)
+@register_as_period_task(crontab=CRONTAB_AT_AM_TEN)
+@atomic()
+@tmp_to_root_org()
+def check_asset_permission_will_expired():
+    first_notice_days = settings.PERM_EXPIRED_FIRST_NOTICE_DAYS
+    daily_notice_days = settings.PERM_EXPIRED_DAILY_NOTICE_DAYS
+    start = local_now()
+    end = start + timedelta(days=first_notice_days + 1)
 
-    ids = AssetPermission.objects.filter(
-        date_expired__gte=start, date_expired__lte=end
-    ).distinct().values_list('id', flat=True)
-    logger.info(f'>>> checking {start} to {end} have {ids} expired')
-    dispatch_process_expired_asset_permission.delay(list(ids))
+    user_asset_remain_day_mapper = defaultdict(dict)
+    org_perm_remain_day_mapper = defaultdict(dict)
 
+    asset_perms = AssetPermission.objects.filter(
+        is_active=True,
+        date_expired__gte=start,
+        date_expired__lte=end
+    ).distinct()
 
-@shared_task(queue='node_tree')
-def dispatch_process_expired_asset_permission(asset_perm_ids):
-    user_ids = User.objects.filter(
-        Q(assetpermissions__id__in=asset_perm_ids) |
-        Q(groups__assetpermissions__id__in=asset_perm_ids)
-    ).distinct().values_list('id', flat=True)
-    RebuildUserTreeTask.objects.bulk_create(
-        [RebuildUserTreeTask(user_id=user_id) for user_id in user_ids]
-    )
+    for asset_perm in asset_perms:
+        date_expired = dt_parser(asset_perm.date_expired)
+        date_expired = timezone.localtime(date_expired).date()
+        remain_days = (date_expired - start.date()).days
+        should_notify = (
+            remain_days == first_notice_days
+            or 0 <= remain_days <= daily_notice_days
+        )
+        if not should_notify:
+            continue
 
-    dispatch_mapping_node_tasks.delay()
+        org = asset_perm.org
+        # 资产授权按照组织分类
+        if org in org_perm_remain_day_mapper[remain_days]:
+            org_perm_remain_day_mapper[remain_days][org].add(asset_perm)
+        else:
+            org_perm_remain_day_mapper[remain_days][org] = {asset_perm, }
 
+        # 计算每个用户即将过期的资产
+        users = asset_perm.get_all_users()
+        assets = asset_perm.get_all_assets()
 
-def create_rebuild_user_tree_task(user_ids):
-    RebuildUserTreeTask.objects.bulk_create(
-        [RebuildUserTreeTask(user_id=i) for i in user_ids]
-    )
-    transaction.on_commit(dispatch_mapping_node_tasks.delay)
+        for u in users:
+            if u in user_asset_remain_day_mapper[remain_days]:
+                user_asset_remain_day_mapper[remain_days][u].update(assets)
+            else:
+                user_asset_remain_day_mapper[remain_days][u] = set(assets)
 
+    for day_count, user_asset_mapper in user_asset_remain_day_mapper.items():
+        for user, assets in user_asset_mapper.items():
+            PermedAssetsWillExpireUserMsg(user, assets, day_count).publish_async()
 
-@shared_task(queue='node_tree')
-def create_rebuild_user_tree_task_by_related_nodes_or_assets(node_ids, asset_ids):
-    node_ids = set(node_ids)
-    node_keys = set()
-    nodes = Node.objects.filter(id__in=node_ids)
-    for _node in nodes:
-        node_keys.update(_node.get_ancestor_keys())
-    node_ids.update(
-        Node.objects.filter(key__in=node_keys).values_list('id', flat=True)
-    )
-
-    asset_perm_ids = set()
-    asset_perm_ids.update(
-        AssetPermission.objects.filter(
-            assets__id__in=asset_ids
-        ).values_list('id', flat=True).distinct()
-    )
-    asset_perm_ids.update(
-        AssetPermission.objects.filter(
-            nodes__id__in=node_ids
-        ).values_list('id', flat=True).distinct()
-    )
-
-    user_ids = set()
-    user_ids.update(
-        User.objects.filter(
-            assetpermissions__id__in=asset_perm_ids
-        ).distinct().values_list('id', flat=True)
-    )
-    user_ids.update(
-        User.objects.filter(
-            groups__assetpermissions__id__in=asset_perm_ids
-        ).distinct().values_list('id', flat=True)
-    )
-
-    create_rebuild_user_tree_task(user_ids)
+    for day_count, org_perm_mapper in org_perm_remain_day_mapper.items():
+        for org, perms in org_perm_mapper.items():
+            org_admins = org.admins.all()
+            for org_admin in org_admins:
+                AssetPermsWillExpireForOrgAdminMsg(org_admin, perms, org, day_count).publish_async()

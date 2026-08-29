@@ -1,14 +1,24 @@
 from typing import List
 
-from assets.models import Node, Asset
-from assets.pagination import AssetLimitOffsetPagination
-from common.utils import lazyproperty, dict_get_any, is_uuid, get_object_or_none
-from assets.utils import get_node, is_query_node_all_assets
+from rest_framework.request import Request
+
+from assets.models import Node, Platform, Protocol, MyAsset
+from assets.utils import get_node_from_request, is_query_node_all_assets
+from common.utils import lazyproperty, timeit
 
 
 class SerializeToTreeNodeMixin:
-    permission_classes = ()
+    request: Request
 
+    @lazyproperty
+    def is_sync(self):
+        sync_paths = ['/api/v1/perms/users/self/nodes/all-with-assets/tree/']
+        for p in sync_paths:
+            if p == self.request.path:
+                return True
+        return False
+
+    @timeit
     def serialize_nodes(self, nodes: List[Node], with_asset_amount=False):
         if with_asset_amount:
             def _name(node: Node):
@@ -16,6 +26,16 @@ class SerializeToTreeNodeMixin:
         else:
             def _name(node: Node):
                 return node.value
+
+        def _open(node):
+            if not self.is_sync:
+                # 异步加载资产树时，默认展开节点
+                return True
+            if not node.parent_key:
+                return True
+            else:
+                return False
+
         data = [
             {
                 'id': node.key,
@@ -23,9 +43,9 @@ class SerializeToTreeNodeMixin:
                 'title': _name(node),
                 'pId': node.parent_key,
                 'isParent': True,
-                'open': node.is_org_root(),
+                'open': _open(node),
                 'meta': {
-                    'node': {
+                    'data': {
                         "id": node.id,
                         "key": node.key,
                         "value": node.value,
@@ -37,48 +57,64 @@ class SerializeToTreeNodeMixin:
         ]
         return data
 
-    def get_platform(self, asset: Asset):
-        default = 'file'
-        icon = {'windows', 'linux'}
-        platform = asset.platform_base.lower()
-        if platform in icon:
-            return platform
-        return default
+    @lazyproperty
+    def support_types(self):
+        from assets.const import AllTypes
+        return AllTypes.get_types_values(exclude_custom=True)
 
-    def serialize_assets(self, assets, node_key=None):
-        if node_key is None:
-            get_pid = lambda asset: getattr(asset, 'parent_key', '')
-        else:
-            get_pid = lambda asset: node_key
+    def get_icon(self, asset):
+        return asset.get_icon_skin()
+        
+    @timeit
+    def serialize_assets(self, assets, node_key=None, get_pid=None):
+        if not get_pid and not node_key:
+            get_pid = lambda asset, platform: getattr(asset, 'parent_key', '')
 
-        data = [
-            {
+        sftp_asset_ids = Protocol.objects.filter(name='sftp') \
+            .values_list('asset_id', flat=True)
+        sftp_asset_ids = set(sftp_asset_ids)
+        platform_map = {p.id: p for p in Platform.objects.all()}
+
+        data = []
+        root_assets_count = 0
+        MyAsset.set_asset_custom_value(assets, self.request.user)
+        for asset in assets:
+            platform = platform_map.get(asset.platform_id)
+            if not platform:
+                continue
+            pid = node_key or get_pid(asset, platform)
+            if not pid:
+                continue
+            # 根节点最多显示 1000 个资产
+            if pid.isdigit():
+                if root_assets_count > 1000:
+                    continue
+                root_assets_count += 1
+            data.append({
                 'id': str(asset.id),
-                'name': asset.hostname,
-                'title': asset.ip,
-                'pId': get_pid(asset),
+                'name': asset.name,
+                'title': f'{asset.address}\n{asset.comment}'.strip(),
+                'pId': pid,
                 'isParent': False,
                 'open': False,
-                'iconSkin': self.get_platform(asset),
+                'iconSkin': self.get_icon(asset),
                 'chkDisabled': not asset.is_active,
                 'meta': {
                     'type': 'asset',
-                    'asset': {
-                        'id': asset.id,
-                        'hostname': asset.hostname,
-                        'ip': asset.ip,
-                        'protocols': asset.protocols_as_list,
-                        'platform': asset.platform_base,
+                    'data': {
+                        'platform_type': platform.type,
+                        'org_name': asset.org_name,
+                        'sftp': asset.id in sftp_asset_ids,
+                        'name': asset.name,
+                        'address': asset.address
                     },
                 }
-            }
-            for asset in assets
-        ]
+            })
         return data
 
 
-class FilterAssetByNodeMixin:
-    pagination_class = AssetLimitOffsetPagination
+class NodeFilterMixin:
+    request: Request
 
     @lazyproperty
     def is_query_node_all_assets(self):
@@ -86,4 +122,4 @@ class FilterAssetByNodeMixin:
 
     @lazyproperty
     def node(self):
-        return get_node(self.request)
+        return get_node_from_request(self.request)

@@ -1,84 +1,91 @@
 # -*- coding: utf-8 -*-
 #
 
-from django.utils.translation import ugettext as _
-from rest_framework import status
-from rest_framework.views import Response
-from rest_framework_bulk import BulkModelViewSet
+from django.conf import settings
+from django.utils.translation import gettext as _
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.generics import RetrieveAPIView
 
-from common.permissions import IsSuperUserOrAppUser
-from common.drf.api import JMSBulkRelationModelViewSet, JMSModelViewSet
-from .models import Organization, ROLE
-from .serializers import (
-    OrgSerializer, OrgReadSerializer,
-    OrgRetrieveSerializer, OrgMemberSerializer
+from accounts.models import AccountTemplate
+from assets.models import (
+    Asset, Zone, Node,
 )
-from users.models import User, UserGroup
-from assets.models import Asset, Domain, AdminUser, SystemUser, Label
-from perms.models import AssetPermission
-from orgs.utils import current_org
+from common.api import JMSBulkModelViewSet
+from common.permissions import IsValidUser, IsValidLicenseForWriteAction
 from common.utils import get_logger
-from .filters import OrgMemberRelationFilterSet
-from .models import OrganizationMember
-
+from labels.models import Label
+from orgs.utils import current_org, tmp_to_root_org
+from perms.models import AssetPermission
+from rbac.permissions import RBACPermission
+from users.models import User, UserGroup
+from .models import Organization
+from .serializers import (
+    OrgSerializer, CurrentOrgSerializer
+)
 
 logger = get_logger(__file__)
 
+# 部分 org 相关的 model，需要清空这些数据之后才能删除该组织
+org_related_models = [
+    User, UserGroup, Asset, Node, Label, Zone, AssetPermission, AccountTemplate
+]
 
-class OrgViewSet(BulkModelViewSet):
-    filter_fields = ('name',)
+
+class OrgViewSet(JMSBulkModelViewSet):
+    filterset_fields = ('name',)
     search_fields = ('name', 'comment')
     queryset = Organization.objects.all()
     serializer_class = OrgSerializer
-    permission_classes = (IsSuperUserOrAppUser,)
-    org = None
+    permission_classes = [RBACPermission, IsValidLicenseForWriteAction]
 
     def get_serializer_class(self):
         mapper = {
-            'list': OrgReadSerializer,
-            'retrieve': OrgRetrieveSerializer
+            'list': OrgSerializer,
+            'retrieve': OrgSerializer
         }
         return mapper.get(self.action, super().get_serializer_class())
 
-    def get_data_from_model(self, model):
+    @tmp_to_root_org()
+    def get_data_from_model(self, org, model):
         if model == User:
-            data = model.objects.filter(orgs__id=self.org.id, m2m_org_members__role=ROLE.USER)
+            data = model.get_org_users(org=org)
+        elif model == Node:
+            # 根节点不能手动删除，所以排除检查
+            data = model.objects.filter(org_id=org.id).exclude(parent_key='', key__regex=r'^[0-9]+$')
         else:
-            data = model.objects.filter(org_id=self.org.id)
+            data = model.objects.filter(org_id=org.id)
         return data
 
-    def destroy(self, request, *args, **kwargs):
-        self.org = self.get_object()
-        models = [
-            User, UserGroup,
-            Asset, Domain, AdminUser, SystemUser, Label,
-            AssetPermission,
-        ]
-        for model in models:
-            data = self.get_data_from_model(model)
-            if data:
-                msg = _('Organization contains undeleted resources')
-                return Response(data={'error': msg}, status=status.HTTP_403_FORBIDDEN)
-        else:
-            if str(current_org) == str(self.org):
-                msg = _('The current organization cannot be deleted')
-                return Response(data={'error': msg}, status=status.HTTP_403_FORBIDDEN)
-            self.org.delete()
-            return Response({'msg': True}, status=status.HTTP_200_OK)
+    def allow_bulk_destroy(self, qs, filtered):
+        return False
+
+    def perform_destroy(self, instance):
+        if str(current_org) == str(instance):
+            msg = _('The current organization ({}) cannot be deleted').format(current_org)
+            raise PermissionDenied(detail=msg)
+
+        if str(instance.id) in settings.AUTH_LDAP_SYNC_ORG_IDS:
+            msg = _(
+                'LDAP synchronization is set to the current organization. '
+                'Please switch to another organization before deleting'
+            )
+            raise PermissionDenied(detail=msg)
+
+        for model in org_related_models:
+            data = self.get_data_from_model(instance, model)
+            if not data:
+                continue
+            msg = _(
+                'The organization have resource ({}) cannot be deleted'
+            ).format(model._meta.verbose_name)
+            raise PermissionDenied(detail=msg)
+
+        super().perform_destroy(instance)
 
 
-class OrgMemberRelationBulkViewSet(JMSBulkRelationModelViewSet):
-    permission_classes = (IsSuperUserOrAppUser,)
-    m2m_field = Organization.members.field
-    serializer_class = OrgMemberSerializer
-    filterset_class = OrgMemberRelationFilterSet
+class CurrentOrgDetailApi(RetrieveAPIView):
+    serializer_class = CurrentOrgSerializer
+    permission_classes = (IsValidUser,)
 
-    def perform_bulk_create(self, serializer):
-        data = serializer.validated_data
-        relations = [OrganizationMember(**i) for i in data]
-        OrganizationMember.objects.bulk_create(relations, ignore_conflicts=True)
-
-    def perform_bulk_destroy(self, queryset):
-        objs = list(queryset.all().prefetch_related('user', 'org'))
-        queryset.delete()
-        self.send_m2m_changed_signal(objs, action='post_remove')
+    def get_object(self):
+        return current_org

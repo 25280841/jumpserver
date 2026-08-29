@@ -1,10 +1,11 @@
-from random import choice, sample
+from random import sample
+
 import forgery_py
 
-from .base import FakeDataGenerator
-
+from orgs.utils import current_org
+from rbac.models import RoleBinding, Role
 from users.models import *
-from orgs.models import OrganizationMember
+from .base import FakeDataGenerator
 
 
 class UserGroupGenerator(FakeDataGenerator):
@@ -21,25 +22,15 @@ class UserGroupGenerator(FakeDataGenerator):
 class UserGenerator(FakeDataGenerator):
     resource = 'user'
     roles: list
-    groups_id: list
+    group_ids: list
 
     def pre_generate(self):
-        self.roles = list(dict(User.ROLE.choices).keys())
-        self.groups_id = list(UserGroup.objects.all().values_list('id', flat=True))
-
-    def set_org(self, users):
-        relations = []
-        for u in users:
-            relations.append(OrganizationMember(
-                org_id=self.org.id,
-                user_id=u.id,
-            ))
-        OrganizationMember.objects.bulk_create(relations, ignore_conflicts=True)
+        self.group_ids = list(UserGroup.objects.all().values_list('id', flat=True))
 
     def set_groups(self, users):
         relations = []
         for i in users:
-            groups_to_join = sample(self.groups_id, 3)
+            groups_to_join = sample(self.group_ids, 3)
             _relations = [User.groups.through(user_id=i.id, usergroup_id=gid) for gid in groups_to_join]
             relations.extend(_relations)
         User.groups.through.objects.bulk_create(relations, ignore_conflicts=True)
@@ -47,16 +38,23 @@ class UserGenerator(FakeDataGenerator):
     def do_generate(self, batch, batch_size):
         users = []
         for i in batch:
-            username = forgery_py.internet.user_name(True)
+            username = forgery_py.internet.user_name(True) + '-' + str(i)
             email = forgery_py.internet.email_address()
             u = User(
                 username=username,
                 email=email,
                 name=username.title(),
-                role=choice(self.roles),
                 created_by='Faker'
             )
             users.append(u)
         users = User.objects.bulk_create(users, ignore_conflicts=True)
-        self.set_org(users)
         self.set_groups(users)
+        self.set_to_org(users)
+
+    def set_to_org(self, users):
+        bindings = []
+        role = Role.objects.get(name='OrgUser')
+        for u in users:
+            b = RoleBinding(user=u, role=role, org_id=current_org.id, scope='org')
+            bindings.append(b)
+        RoleBinding.objects.bulk_create(bindings, ignore_conflicts=True)

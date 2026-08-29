@@ -11,74 +11,80 @@
 
 import uuid
 
-from django.db.models import *
-from django.db.models.functions import Concat
-from django.utils.translation import ugettext_lazy as _
+from django.db import models
+from django.db import transaction
+from django.db.models import F, ExpressionWrapper, CASCADE
+from django.db.models import QuerySet
+from django.utils.translation import gettext_lazy as _
+
+from ..const.signals import OP_LOG_SKIP_SIGNAL
 
 
-class Choice(str):
-    def __new__(cls, value, label=''):  # `deepcopy` 的时候不会传 `label`
-        self = super().__new__(cls, value)
-        self.label = label
-        return self
+class ChoicesMixin:
+    _value2label_map_: dict
+
+    @classmethod
+    def get_label(cls, value: (str, int)):
+        return cls._value2label_map_[value]
 
 
-class ChoiceSetType(type):
-    def __new__(cls, name, bases, attrs):
-        _choices = []
-        collected = set()
-        new_attrs = {}
-        for k, v in attrs.items():
-            if isinstance(v, tuple):
-                v = Choice(*v)
-                assert v not in collected, 'Cannot be defined repeatedly'
-                _choices.append(v)
-                collected.add(v)
-            new_attrs[k] = v
-        for base in bases:
-            if hasattr(base, '_choices'):
-                for c in base._choices:
-                    if c not in collected:
-                        _choices.append(c)
-                        collected.add(c)
-        new_attrs['_choices'] = _choices
-        new_attrs['_choices_dict'] = {c: c.label for c in _choices}
-        return type.__new__(cls, name, bases, new_attrs)
-
-    def __contains__(self, item):
-        return self._choices_dict.__contains__(item)
-
-    def __getitem__(self, item):
-        return self._choices_dict.__getitem__(item)
-
-    def get(self, item, default=None):
-        return self._choices_dict.get(item, default)
-
-    @property
-    def choices(self):
-        return [(c, c.label) for c in self._choices]
-
-
-class ChoiceSet(metaclass=ChoiceSetType):
-    choices = None  # 用于 Django Model 中的 choices 配置， 为了代码提示在此声明
-
-
-class JMSBaseModel(Model):
-    created_by = CharField(max_length=32, null=True, blank=True, verbose_name=_('Created by'))
-    updated_by = CharField(max_length=32, null=True, blank=True, verbose_name=_('Updated by'))
-    date_created = DateTimeField(auto_now_add=True, null=True, blank=True, verbose_name=_('Date created'))
-    date_updated = DateTimeField(auto_now=True, verbose_name=_('Date updated'))
+class BaseCreateUpdateModel(models.Model):
+    created_by = models.CharField(max_length=128, null=True, blank=True, verbose_name=_('Created by'))
+    updated_by = models.CharField(max_length=128, null=True, blank=True, verbose_name=_('Updated by'))
+    date_created = models.DateTimeField(auto_now_add=True, null=True, blank=True, verbose_name=_('Date created'))
+    date_updated = models.DateTimeField(auto_now=True, verbose_name=_('Date updated'))
+    comment = models.TextField(default='', blank=True, verbose_name=_('Comment'))
 
     class Meta:
         abstract = True
 
 
-class JMSModel(JMSBaseModel):
-    id = UUIDField(default=uuid.uuid4, primary_key=True)
+class JMSBaseModel(BaseCreateUpdateModel):
+    id = models.UUIDField(default=uuid.uuid4, primary_key=True)
 
     class Meta:
         abstract = True
 
+    def __str__(self):
+        return str(self.id)
 
-def concated_display(name1, name2):
-    return Concat(F(name1), Value('('), F(name2), Value(')'))
+
+# Mysql PostgreSQL incompatible (ce6e5038a6134fad83aba220e6204cf9 ce6e5038-a613-4fad-83ab-a220e6204cf9)
+def output_as_string(field_name):
+    return ExpressionWrapper(F(field_name), output_field=models.CharField())
+
+
+class MultiTableChildQueryset(QuerySet):
+    def bulk_create(self, objs, batch_size=None):
+        assert batch_size is None or batch_size > 0
+        if not objs:
+            return objs
+
+        self._for_write = True
+        objs = list(objs)
+        parent_model = self.model._meta.pk.related_model
+
+        parent_objs = []
+        for obj in objs:
+            parent_values = {}
+            for field in [f for f in parent_model._meta.fields if hasattr(obj, f.name)]:
+                parent_values[field.name] = getattr(obj, field.name)
+            parent_objs.append(parent_model(**parent_values))
+            setattr(obj, self.model._meta.pk.attname, obj.id)
+        parent_model.objects.bulk_create(parent_objs, batch_size=batch_size)
+
+        with transaction.atomic(using=self.db, savepoint=False):
+            self._batched_insert(objs, self.model._meta.local_fields, batch_size)
+
+        return objs
+
+
+def CASCADE_SIGNAL_SKIP(collector, field, sub_objs, using):
+    # 级联删除时，操作日志标记不保存，以免用户混淆
+    try:
+        for obj in sub_objs:
+            setattr(obj, OP_LOG_SKIP_SIGNAL, True)
+    except:
+        pass
+
+    CASCADE(collector, field, sub_objs, using)

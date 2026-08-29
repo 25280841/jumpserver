@@ -1,78 +1,74 @@
 # -*- coding: utf-8 -*-
 #
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
-from common.serializers import AdaptedBulkListSerializer
+from common.serializers import ResourceLabelsMixin
+from common.serializers.fields import ObjectRelatedField
 from orgs.mixins.serializers import BulkOrgResourceModelSerializer
+from .gateway import GatewayWithAccountSecretSerializer
+from ..models import Zone, Gateway
 
-from ..models import Domain, Gateway
-from .base import AuthSerializerMixin
+__all__ = ['ZoneSerializer', 'ZoneWithGatewaySerializer', 'ZoneListSerializer']
 
 
-class DomainSerializer(BulkOrgResourceModelSerializer):
-    asset_count = serializers.SerializerMethodField()
-    gateway_count = serializers.SerializerMethodField()
+class ZoneSerializer(ResourceLabelsMixin, BulkOrgResourceModelSerializer):
+    gateways = ObjectRelatedField(
+        many=True, required=False, label=_('Gateway'), queryset=Gateway.objects,
+        help_text=_(
+            "A gateway is a network proxy for a zone, and when connecting assets within the zone, "
+            "the connection is routed through the gateway.")
+    )
+    assets_amount = serializers.IntegerField(label=_('Assets amount'), read_only=True)
 
     class Meta:
-        model = Domain
+        model = Zone
         fields_mini = ['id', 'name']
-        fields_small = fields_mini + [
-            'comment', 'date_created'
-        ]
-        fields_m2m = [
-            'asset_count', 'assets', 'gateway_count',
-        ]
-        fields = fields_small + fields_m2m
-        read_only_fields = ('asset_count', 'gateway_count', 'date_created')
-        extra_kwargs = {
-            'assets': {'required': False}
+        fields_small = fields_mini + ['comment']
+        relation_count_fields = {
+            'assets_amount': {
+                'relation': 'assets',
+                'excludes': {'platform__name__startswith': 'Gateway'},
+            },
         }
-        list_serializer_class = AdaptedBulkListSerializer
+        amount_fields = list(relation_count_fields)
+        fields_m2m = ['assets', 'gateways', 'labels'] + amount_fields
+        read_only_fields = ['date_created']
+        fields = fields_small + fields_m2m + read_only_fields
+        extra_kwargs = {
+            'assets': {'required': False, 'label': _('Assets')},
+        }
 
-    @staticmethod
-    def get_asset_count(obj):
-        return obj.assets.count()
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        assets = data.get('assets')
+        if assets is None:
+            return data
+        gateway_ids = [str(i['id']) for i in data['gateways']]
+        data['assets'] = [i for i in assets if str(i['id']) not in gateway_ids]
+        return data
 
-    @staticmethod
-    def get_gateway_count(obj):
-        return obj.gateway_set.all().count()
+    def create(self, validated_data):
+        assets = validated_data.pop('assets', [])
+        gateways = validated_data.pop('gateways', [])
+        validated_data['assets'] = assets + gateways
+        return super().create(validated_data)
 
-
-class GatewaySerializer(AuthSerializerMixin, BulkOrgResourceModelSerializer):
-    class Meta:
-        model = Gateway
-        list_serializer_class = AdaptedBulkListSerializer
-        fields = [
-            'id', 'name', 'ip', 'port', 'protocol', 'username', 'password',
-            'private_key', 'public_key', 'domain', 'is_active', 'date_created',
-            'date_updated', 'created_by', 'comment',
-        ]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.protocol_limit_to_ssh()
-
-    def protocol_limit_to_ssh(self):
-        protocol_field = self.fields['protocol']
-        choices = protocol_field.choices
-        choices.pop('rdp')
-        protocol_field._choices = choices
+    def update(self, instance, validated_data):
+        assets = validated_data.pop('assets', list(instance.assets.all()))
+        gateways = validated_data.pop('gateways', list(instance.gateways.all()))
+        validated_data['assets'] = assets + gateways
+        return super().update(instance, validated_data)
 
 
-class GatewayWithAuthSerializer(GatewaySerializer):
-    def get_field_names(self, declared_fields, info):
-        fields = super().get_field_names(declared_fields, info)
-        fields.extend(
-            ['password', 'private_key']
-        )
-        return fields
+class ZoneListSerializer(ZoneSerializer):
+    class Meta(ZoneSerializer.Meta):
+        fields = list(set(ZoneSerializer.Meta.fields + ZoneSerializer.Meta.amount_fields) - {'assets'})
 
 
-
-
-class DomainWithGatewaySerializer(BulkOrgResourceModelSerializer):
-    gateways = GatewayWithAuthSerializer(many=True, read_only=True)
+class ZoneWithGatewaySerializer(serializers.ModelSerializer):
+    gateways = GatewayWithAccountSecretSerializer(many=True, read_only=True)
 
     class Meta:
-        model = Domain
+        model = Zone
         fields = '__all__'
